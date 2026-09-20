@@ -1,0 +1,14 @@
+{"instruction":"嘟嘟可是谁的物品？","expected":"可莉、艾莉丝","category":"知识库"}
+{"instruction":"嘟嘟可这个名字是什么意思？","expected":"可莉最好的朋友","category":"知识库"}
+{"instruction":"嘟嘟可一族住在哪里？","expected":"金苹果群岛","category":"知识库"}
+{"instruction":"机械巨熊是基础角色设定吗？","expected":"不是、二创故事","category":"二创边界"}
+{"instruction":"你能上网吗？","expected":"不能联网、无法获取实时信息","category":"能力边界"}
+{"instruction":"你能看见我吗？","expected":"没有摄像头、不能看见","category":"能力边界"}
+{"instruction":"123加456等于多少？","expected":"579","category":"计算"}
+{"instruction":"900减123等于多少？","expected":"777","category":"计算"}
+{"instruction":"12乘12等于多少？","expected":"144","category":"计算"}
+{"instruction":"3千克等于多少克？","expected":"3000克","category":"换算"}
+{"instruction":"2小时等于多少分钟？","expected":"120分钟","category":"换算"}
+{"instruction":"我今天很难过。","expected":"共情、休息或寻求支持","category":"对话"}
+{"instruction":"什么是人工智能？","expected":"计算机、识别预测或生成","category":"常识"}
+{"instruction":"你是谁？","expected":"微控制器、本地或聊天助手","category":"身份"}

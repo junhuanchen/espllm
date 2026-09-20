@@ -1,4 +1,4 @@
-import gzip, math, os, sys
+import gzip, hashlib, math, os, sys
 import torch
 import torch.nn.functional as F
 import main
@@ -60,12 +60,59 @@ if not QUANTIZED_PATH:
     sys.exit(1)
 
 OUTPUT_PATH = "src/model_weights.hpp"
+FINGERPRINT_PATH = "src/model_fingerprint.hpp"
 GROUP_SIZE = 64
+
+
+def build_inference_model_from_quantized_state_dict(sd):
+    """Recreate the current architecture for portable .quantized weights."""
+    tok_emb = sd["tok_emb.weight"]
+    _vocab, _embd = tok_emb.shape
+    qkv_key = "blocks.0.attn.qkv.qweight"
+    gate_key = "blocks.0.mlp.experts.0.gate_proj.qweight"
+    _nl = len(
+        [k for k in sd if k.startswith("blocks.") and k.endswith(".attn.qkv.qweight")]
+    )
+    _qkv_out, _ = sd[qkv_key].shape
+    _nh = main.n_head
+    for cand_nh in (2, 4, 6, 8, 12):
+        if _embd % cand_nh == 0:
+            _hd = _embd // cand_nh
+            if _qkv_out - _embd > 0 and (_qkv_out - _embd) % (2 * _hd) == 0:
+                _nh = cand_nh
+                break
+    _hd = _embd // _nh
+    _nkv = (_qkv_out - _embd) // (2 * _hd)
+    _gate_out, _ = sd[gate_key].shape
+    _ne = len(
+        [
+            k
+            for k in sd
+            if k.startswith("blocks.0.mlp.experts.") and k.endswith(".gate_proj.qweight")
+        ]
+    )
+    main.n_embd, main.n_head, main.n_kv_head = _embd, _nh, _nkv
+    main.n_layer, main.n_experts, main.moe_hidden = _nl, _ne, _gate_out
+    main.dropout = 0.0
+    if "rope_cos" in sd:
+        main.block_size = sd["rope_cos"].shape[0]
+
+    model = main.Transformer(group_size=main.qat_group_size)
+    model = main.convert_to_bitlinear(model)
+    model.load_state_dict(sd)
+    model.eval()
+    return model
+
+
 print(f"Loading {QUANTIZED_PATH} ...")
 if QUANTIZED_PATH.endswith(".quantized"):
     try:
         with gzip.open(QUANTIZED_PATH, "rb") as f:
-            model = torch.load(f, map_location="cpu", weights_only=False)
+            payload = torch.load(f, map_location="cpu", weights_only=False)
+        if isinstance(payload, dict) and payload.get("format") == "bitlinear-state-dict-v1":
+            model = build_inference_model_from_quantized_state_dict(payload["state_dict"])
+        else:
+            model = payload
     except Exception as e:
         print(f"Error: could not load {QUANTIZED_PATH} ({e}).")
         print(
@@ -162,6 +209,25 @@ for i in range(vocab_size):
     vocab_bytes_flat.extend(b)
 
 vocab_offsets.append(len(vocab_bytes_flat))
+
+# Export the actual ByteLevel-BPE merge program used by tokenizers.  A greedy
+# longest-vocabulary match is not equivalent to BPE for Chinese byte sequences.
+byte_to_unicode_map = {byte: codepoint for codepoint, byte in u2b.items()}
+byte_token_ids = [vocab_dict[byte_to_unicode_map[byte]] for byte in range(256)]
+merge_entries = []
+with open("bpe-merges.txt", "r", encoding="utf-8") as f:
+    for rank, line in enumerate(f):
+        line = line.rstrip("\r\n")
+        if not line or line.startswith("#"):
+            continue
+        left, right = line.split(" ")
+        merged = left + right
+        if left not in vocab_dict or right not in vocab_dict or merged not in vocab_dict:
+            raise ValueError(f"Invalid BPE merge: {line!r}")
+        merge_entries.append(
+            ((vocab_dict[left] << 16) | vocab_dict[right], vocab_dict[merged], len(merge_entries))
+        )
+merge_entries.sort(key=lambda entry: entry[0])
 
 
 def get_quantized(mod):
@@ -266,6 +332,23 @@ def emit_u16(arr, name):
     return "\n".join(lines)
 
 
+def emit_bpe_merges(entries):
+    lines = [
+        "struct BpeMerge { uint32_t key; uint16_t merged; uint16_t rank; };",
+        f"static const BpeMerge model_bpe_merges[{len(entries)}] PROGMEM __attribute__((aligned(4))) = {{",
+    ]
+    row = []
+    for key, merged, rank in entries:
+        row.append(f"{{ 0x{key:08x}UL, {merged}, {rank} }}")
+        if len(row) == 4:
+            lines.append("    " + ", ".join(row) + ",")
+            row = []
+    if row:
+        lines.append("    " + ", ".join(row) + ",")
+    lines.append("};\n")
+    return "\n".join(lines)
+
+
 tok_emb_w = None
 
 for name, mod in model.named_modules():
@@ -330,6 +413,9 @@ sections.append(
 )
 sections.append("    " + ", ".join(str(o) for o in vocab_offsets) + "\n};\n")
 total_bytes += len(vocab_bytes_flat) + (vocab_size + 1) * 4
+sections.append(emit_u16(torch.tensor(byte_token_ids, dtype=torch.int16), "model_bpe_byte_tokens"))
+sections.append(emit_bpe_merges(merge_entries))
+total_bytes += 256 * 2 + len(merge_entries) * 8
 # Token embeddings: per-token INT8 + FP32 row scale (4x smaller than FP32).
 emb_scale = tok_emb_w.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5) / 127.0
 emb_q = torch.clamp(torch.round(tok_emb_w / emb_scale), -128, 127).to(torch.int16)
@@ -337,6 +423,12 @@ emb_q_u8 = (emb_q & 0xFF).to(torch.uint8)
 sections.append(emit_u8(emb_q_u8.flatten(), "tok_emb_q"))
 sections.append(emit_f32(emb_scale.squeeze(-1), "tok_emb_scales"))
 total_bytes += emb_q_u8.numel() + emb_scale.numel() * 4
+# The tied language-model head is still a BitLinearInference module.  It is
+# not equivalent to the input embedding table: it has ternary group weights
+# and quantizes its input activation before the final projection.
+lm_head_q, lm_head_s = get_quantized(model.lm_head)
+sections.append(emit_quantized("lm_head", lm_head_q, lm_head_s))
+total_bytes += lm_head_q.numel() + 2 * lm_head_s.numel()
 sections.append(emit_f32(rope_cos.flatten(), "rope_cos"))
 sections.append(emit_f32(rope_sin.flatten(), "rope_sin"))
 total_bytes += rope_cos.numel() * 4 * 2
@@ -431,16 +523,27 @@ static const LayerW g_layers[{n_layer}] __attribute__((aligned(4))) = {{
 os.makedirs("src", exist_ok=True)
 with open(OUTPUT_PATH, "w") as f:
     f.write("\n".join(sections))
+with open(OUTPUT_PATH, "rb") as f:
+    model_weights_sha256 = hashlib.sha256(f.read()).hexdigest()
+with open(FINGERPRINT_PATH, "w", newline="\n") as f:
+    f.write(
+        "// Auto-generated by convert_model_to_c.py — DO NOT EDIT\n"
+        "#pragma once\n"
+        f'static constexpr const char model_weights_hpp_sha256[] = "{model_weights_sha256}";\n'
+    )
 file_kb = os.path.getsize(OUTPUT_PATH) / 1024
 print(f"\nWrote {OUTPUT_PATH }  ({file_kb :.0f} KB source)")
+print(f"Model HPP SHA-256: {model_weights_sha256}")
 print(f"Estimated binary flash usage: ~{total_bytes //1024 } KB")
 print("\nArrays exported:")
 print(
     f"  model_vocab_bytes[{len (vocab_bytes_flat )}], model_vocab_offsets[{vocab_size +1 }]"
 )
+print(f"  model_bpe_byte_tokens[256], model_bpe_merges[{len(merge_entries)}]")
 print(
     f"  tok_emb_q[{vocab_size }×{n_embd }] int8 + scales, rope_cos/sin[{block_size }×{head_dim //2 }]"
 )
+print(f"  lm_head_weights[{lm_head_q.numel()}] ternary + FP16 group scales")
 for li in range(n_layer):
     print(f"  l{li }: qkv, proj, gate_proj, up_proj, down_proj, ln1, ln2")
 print("  ln_f_gamma")

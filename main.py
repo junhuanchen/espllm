@@ -33,6 +33,17 @@ else:
 
 import sys
 
+
+def cli_value(name):
+    """Read --name VALUE or --name=VALUE without adding a parser dependency."""
+    prefix = name + "="
+    for index, arg in enumerate(sys.argv):
+        if arg.startswith(prefix):
+            return arg[len(prefix):]
+        if arg == name and index + 1 < len(sys.argv):
+            return sys.argv[index + 1]
+    return None
+
 TARGET = "esp8266"
 for arg in sys.argv:
     if arg.startswith("--target="):
@@ -56,6 +67,14 @@ for _i, _arg in enumerate(sys.argv):
 DIST = False  # True once torch.distributed is initialized (deepspeed path only)
 RANK = 0
 WORLD = 1
+RESUME_TRAINING = "--resume" in sys.argv or any(arg.startswith("--resume=") for arg in sys.argv)
+RESUME_PATH = next((arg.split("=", 1)[1] for arg in sys.argv if arg.startswith("--resume=")), None)
+STOP_AFTER = cli_value("--stop-after")
+SAVE_INTERVAL = cli_value("--save-interval")
+if STOP_AFTER is not None:
+    STOP_AFTER = int(STOP_AFTER)
+    if STOP_AFTER < 1:
+        raise ValueError("--stop-after must be at least 1")
 
 if TARGET == "esp8266":
     # Max config fitting 1MB irom + 40KB static arena (INT8 emb + FP16 scales).
@@ -146,6 +165,16 @@ if os.environ.get("ESPGPT_CHECKPOINT"):
     checkpoint = os.environ["ESPGPT_CHECKPOINT"]
 if os.environ.get("ESPGPT_DEVICE"):
     device = os.environ["ESPGPT_DEVICE"]
+
+if SAVE_INTERVAL is not None:
+    SAVE_INTERVAL = int(SAVE_INTERVAL)
+    if SAVE_INTERVAL < 1:
+        raise ValueError("--save-interval must be at least 1")
+else:
+    SAVE_INTERVAL = eval_interval
+
+train_state_path = checkpoint + ".trainstate"
+resume_state = None
 
 torch.manual_seed(1337)
 
@@ -516,7 +545,7 @@ class Transformer(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temp=temperature, top_k=1, rep_penalty=1.0):
+    def generate(self, idx, max_new_tokens, temp=temperature, top_k=1, rep_penalty=1.0, echo=True):
         prompt_len = len(decode(idx[0].tolist()))
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
@@ -538,12 +567,15 @@ class Transformer(nn.Module):
             idx = torch.cat((idx, next_id), dim=1)
             current_text = decode(idx[0].tolist())
             new_text = current_text[prompt_len:]
-            if "\ufffd" not in new_text:
-                print(new_text, end="", flush=True)
-                prompt_len = len(current_text)
             if "\n" in new_text:
                 break
-        print()
+        # Byte-level BPE can decode an incomplete UTF-8 character as U+FFFD
+        # while individual byte tokens are arriving. Printing only when no
+        # replacement character exists made Chinese replies stay silent forever.
+        full_text = decode(idx[0].tolist())
+        reply = full_text[prompt_len:].replace("\ufffd", "")
+        if echo:
+            print(reply)
         return idx
 
 
@@ -582,10 +614,79 @@ def convert_to_bitlinear(model: nn.Module) -> nn.Module:
     return model
 
 
+QUANTIZED_CHECKPOINT_FORMAT = "bitlinear-state-dict-v1"
+
+
+def save_quantized_model(q_model: nn.Module):
+    """Save inference weights without pickling classes from ``__main__``."""
+    output = checkpoint + ".quantized"
+    temporary = output + ".tmp"
+    payload = {
+        "format": QUANTIZED_CHECKPOINT_FORMAT,
+        "state_dict": q_model.state_dict(),
+    }
+    with gzip.open(temporary, "wb") as f:
+        torch.save(payload, f)
+    os.replace(temporary, output)
+
+
+def load_quantized_model(path: str) -> nn.Module:
+    """Load a portable quantized checkpoint into the current model definition."""
+    with gzip.open(path, "rb") as f:
+        payload = torch.load(f, map_location=device, weights_only=False)
+    if not isinstance(payload, dict) or payload.get("format") != QUANTIZED_CHECKPOINT_FORMAT:
+        raise ValueError("legacy or unsupported quantized checkpoint format")
+    if "state_dict" not in payload:
+        raise ValueError("quantized checkpoint has no state_dict")
+
+    q_model = convert_to_bitlinear(deepcopy(model))
+    q_model.load_state_dict(payload["state_dict"])
+    q_model.to(device)
+    q_model.eval()
+    return q_model
+
+
+def save_train_state(next_iter, best_val_loss, patience_counter, scheduler):
+    """Persist all single-GPU state required for an exact training resume."""
+    state = {
+        "version": 1,
+        "target": TARGET,
+        "dataset_path": os.path.abspath(dataset_path),
+        "next_iter": next_iter,
+        "best_val_loss": best_val_loss,
+        "patience_counter": patience_counter,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "torch_rng": torch.get_rng_state(),
+        "python_rng": random.getstate(),
+    }
+    if torch.cuda.is_available():
+        state["cuda_rng"] = torch.cuda.get_rng_state_all()
+    torch.save(state, train_state_path)
+
+
+def restore_train_state(path):
+    state = torch.load(path, map_location=device, weights_only=False)
+    if state.get("target") != TARGET:
+        raise ValueError(f"Resume target mismatch: {state.get('target')} != {TARGET}")
+    if state.get("dataset_path") != os.path.abspath(dataset_path):
+        raise ValueError("Resume dataset mismatch: keep dataset.txt unchanged when resuming")
+    model.load_state_dict(state["model"])
+    optimizer.load_state_dict(state["optimizer"])
+    torch.set_rng_state(state["torch_rng"])
+    random.setstate(state["python_rng"])
+    if torch.cuda.is_available() and "cuda_rng" in state:
+        torch.cuda.set_rng_state_all(state["cuda_rng"])
+    return state
+
+
 def train():
     global model
     engine = globals().get("engine", None)
     is_main = RANK == 0
+    if resume_state is not None and engine is not None:
+        raise RuntimeError("--resume currently supports single-GPU training only; omit --deepspeed")
     if DIST:
         # Model weights were initialized identically on all ranks (torch seed
         # 1337 at import). Now decorrelate per-rank stochasticity (dropout
@@ -601,7 +702,21 @@ def train():
     # from the ds config.
     opt = optimizer
     scheduler = CosineAnnealingLR(opt, T_max=20000, eta_min=lr_min)
-    for it in range(start_iter, max_iters + 1):
+    run_start = start_iter
+    if resume_state is not None:
+        scheduler.load_state_dict(resume_state["scheduler"])
+        best_val_loss = resume_state["best_val_loss"]
+        patience_counter = resume_state["patience_counter"]
+        run_start = resume_state["next_iter"]
+        if is_main:
+            print(f"Resuming at iter {run_start} from {train_state_path}")
+    run_end = max_iters
+    if STOP_AFTER is not None:
+        run_end = min(max_iters, run_start + STOP_AFTER - 1)
+    next_iter = run_start
+    interrupted = False
+    try:
+      for it in range(run_start, run_end + 1):
         if it < warmup_iters:
             warmup_lr = lr * (it + 1) / warmup_iters
             for pg in opt.param_groups:
@@ -656,11 +771,22 @@ def train():
                     engine.optimizer.zero_grad()
                 else:
                     optimizer.zero_grad(set_to_none=True)
-                continue  # skip this iteration
-            else:
-                raise  # re-raise non-OOM errors
+                next_iter = it + 1
+                continue
+            raise
         if it >= warmup_iters:
             scheduler.step()
+        next_iter = it + 1
+        if is_main and engine is None and next_iter % SAVE_INTERVAL == 0:
+            save_train_state(next_iter, best_val_loss, patience_counter, scheduler)
+    except KeyboardInterrupt:
+        interrupted = True
+        if is_main:
+            print(f"\nInterrupted at iter {next_iter}; saving resumable state.")
+    if is_main and engine is None:
+        save_train_state(next_iter, best_val_loss, patience_counter, scheduler)
+        if interrupted:
+            print("Resume with: --train --resume --stop-after N")
     if not is_main:
         if DIST:
             import torch.distributed as dist
@@ -674,8 +800,7 @@ def train():
         model.eval()
         print("Loaded best checkpoint for quantization.")
     q_model = convert_to_bitlinear(deepcopy(model))
-    with gzip.open(checkpoint + ".quantized", "wb") as f:
-        torch.save(q_model, f)
+    save_quantized_model(q_model)
     quant_size = os.path.getsize(checkpoint + ".quantized")
     print(
         f"Quantized model saved → {checkpoint }.quantized  ({quant_size /1024 :.1f} KB)"
@@ -690,12 +815,12 @@ def load_model():
     global model
     if os.path.isfile(checkpoint + ".quantized"):
         print("Loading quantized model (primary)...")
-        with gzip.open(checkpoint + ".quantized", "rb") as f:
-            model = torch.load(f, map_location=device, weights_only=False)
-        model.to(device)
-        model.eval()
-        print("Quantized model ready.")
-        return
+        try:
+            model = load_quantized_model(checkpoint + ".quantized")
+            print("Quantized model ready.")
+            return
+        except Exception as exc:
+            print(f"Quantized checkpoint is incompatible or damaged ({exc}); rebuilding it.")
     src = None
     if os.path.isfile(checkpoint + ".best"):
         src = checkpoint + ".best"
@@ -706,13 +831,9 @@ def load_model():
         model.load_state_dict(torch.load(src, map_location=device))
         model.eval()
         q_model = convert_to_bitlinear(deepcopy(model))
-        with gzip.open(checkpoint + ".quantized", "wb") as f:
-            torch.save(q_model, f)
+        save_quantized_model(q_model)
         print(f"Quantized and saved → {checkpoint }.quantized")
-        with gzip.open(checkpoint + ".quantized", "rb") as f:
-            model = torch.load(f, map_location=device, weights_only=False)
-        model.to(device)
-        model.eval()
+        model = load_quantized_model(checkpoint + ".quantized")
         return
     print("No checkpoint found — training from scratch...")
     train()
@@ -748,7 +869,7 @@ def generate_reply(max_token_length):
     prompt_len = len(decode(context[0].tolist()))
     output_ids = model.generate(context, max_new_tokens=max_token_length)
     full_output = decode(output_ids[0].tolist())
-    bot_reply = full_output[prompt_len:].strip()
+    bot_reply = full_output[prompt_len:].replace("\ufffd", "").strip()
     if "\nUser:" in bot_reply:
         bot_reply = bot_reply.split("\nUser:")[0]
     conversation_history += bot_reply + "\n"
@@ -816,8 +937,21 @@ if __name__ == "__main__":
     else:
         print("Using standard 32-bit AdamW optimizer (torch.optim.AdamW)...")
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
+    if RESUME_TRAINING:
+        if not force_train:
+            print("ERROR: --resume requires --train")
+            sys.exit(2)
+        if ds_mode:
+            print("ERROR: --resume currently supports single-GPU training only")
+            sys.exit(2)
+        if RESUME_PATH:
+            train_state_path = RESUME_PATH
+        if not os.path.isfile(train_state_path):
+            print(f"ERROR: resume state not found: {train_state_path}")
+            sys.exit(2)
+        resume_state = restore_train_state(train_state_path)
     if force_train:
-        print("Forcing training from scratch...")
+        print("Resuming training..." if RESUME_TRAINING else "Forcing training from scratch...")
         train()
         if ds_mode:
             # Rank 0 already saved .pt / .best / .quantized inside train().

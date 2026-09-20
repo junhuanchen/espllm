@@ -54,8 +54,10 @@ static inline void llm_optimistic_yield(uint32_t every_n_ops = 256) {
         yield();
     }
 }
-#elif defined(ESP32) || defined(ESP32S3_BOARD)
+#elif defined(ESP32) || defined(ESP32S3_BOARD) || defined(ESP_PLATFORM)
+#if !defined(ESP_PLATFORM)
 #include <Arduino.h>
+#endif
 static inline void llm_optimistic_yield(uint32_t every_n_ops = 512) {
     static uint32_t counter = 0;
     if (++counter >= every_n_ops) {

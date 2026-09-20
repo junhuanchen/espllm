@@ -319,6 +319,293 @@ automatic best-checkpoint restore (`*.pt.best`) plus post-training quantization 
 the artifact the firmware export consumes). On Apple Silicon the S3 run is roughly a day;
 `flash.py <target>` re-exports weights and flashes in one step.
 
+### 7.3 嘟嘟可知识库：可复现训练流程
+
+完整的数据制作规则见 [`docs/duduke-knowledgebase-training.md`](docs/duduke-knowledgebase-training.md)。
+本流程为当前单轮 ESP32-S3 模型加入嘟嘟可主题知识；二创剧情（例如机械巨熊、神之心碎片）在训练数据中会明确标为“本知识库的二创故事”，不能作为基础角色事实回答。
+
+相关文件：
+
+| 文件 | 用途 |
+| --- | --- |
+| `data/duduke/qa_train.jsonl` | 40 条带类别与来源的知识库训练问答。 |
+| `data/duduke/qa_eval.jsonl` | 12 条独立验收题，绝不能参与训练。 |
+| `tools/export_knowledgebase_dataset.py` | 校验并导出 `main.py` 所需的 `User:/Bot:` 格式。 |
+
+在 Windows PowerShell、仓库根目录生成混合训练集。首次运行会保存原始数据；已有
+`dataset.before-duduke.txt` 时不会覆盖该备份：
+
+```powershell
+if (-not (Test-Path dataset.before-duduke.txt)) { Copy-Item dataset.txt dataset.before-duduke.txt }
+python tools/export_knowledgebase_dataset.py --base dataset.before-duduke.txt --knowledge-repeat 200 --output dataset.duduke-mixed.txt
+```
+
+本项目这次的实际输出为 **107,818 train pairs**。`--knowledge-repeat 200` 将 40 条知识库
+问答重复采样，以免它们被约十万条通用问答淹没。若主题知识不足可尝试 300；若通用聊天
+能力变差则降低该数值并重新评测。
+
+确认混合结果后，才将其作为本轮训练数据：
+
+```powershell
+Copy-Item dataset.duduke-mixed.txt dataset.txt -Force
+```
+
+数据改变后必须重新训练 BPE tokenizer，再训练模型。建议在 WSL 使用第二张可见 GPU
+（本机为 RTX 3090）执行：
+
+```bash
+cd /mnt/d/github/espllm
+python3 -m pipenv run python3 train_tokenizer.py
+CUDA_VISIBLE_DEVICES=1 python3 -m pipenv run python3 main.py --target=esp32s3 --train
+```
+
+`--train` 当前总是从头训练，不会在旧的 `.pt.best` 上继续微调。ESP32-S3 配置最多训练
+25,000 iterations，每 200 iterations 验证一次；连续 12 次验证没有改进时早停。每次验证
+改进都会写入 `model/model_esp32s3.pt.best`。若已达到满意效果，可以 `Ctrl+C` 停止，最后
+已保存的最佳 checkpoint 仍可用。
+
+训练后不要只看 `val loss`。启动模型并用 `data/duduke/qa_eval.jsonl` 中的 12 个问题逐条
+提问，至少要求 10/12 个关键点正确，且两道二创边界题都明确说明“二创故事”而不当作基础
+事实。确认后导出模型、编译并烧录：
+
+```bash
+python3 convert_model_to_c.py esp32s3
+```
+
+```powershell
+& C:\esp\v5.5.5\esp-idf\export.ps1
+idf.py build
+idf.py -p COM3 flash
+```
+
+若本轮模型效果不满意，恢复未混合的训练数据：
+
+```powershell
+Copy-Item dataset.before-duduke.txt dataset.txt -Force
+```
+
+如果 Windows 串口终端无法通过中文输入法发送 UTF-8 字符，可使用固件内置的 ASCII
+中文测试命令。它们将对应的 UTF-8 中文问题送入真实 tokenizer 和模型推理，**回答不是
+硬编码内容**：
+
+```text
+:zhhelp  显示测试题列表
+:zh1     嘟嘟可是谁的物品？
+:zh2     嘟嘟可这个名字是什么意思？
+:zh3     嘟嘟可一族住在哪里？
+:zh4     机械巨熊是基础角色设定吗？
+:zh5     可莉会把嘟嘟可称作普通挂件吗？
+:zh6     嘟嘟可是由谁做出来送给可莉的？
+:zh7     嘟嘟可一族远行时想寻找什么？
+```
+
+其中 `:zh4` 是二创边界测试；合格回答应说明它来自本知识库的二创故事，而非基础角色事实。
+`:zh5` 至 `:zh7` 不在中文验收集的 14 道固定题中，用于观察模型对相近但不同问法的泛化能力。
+
+### 7.4 中文专用模型
+
+如需放弃英文问答并训练中文专用模型，请使用 `build_dataset_zh.py` 生成独立的
+`dataset_zh.txt`。完整的数据构成、GPU 训练、验收与回退流程见
+[`docs/README_zh.md`](docs/README_zh.md)；该中文教学指南还包含 BPE 一致性、哈希校验、
+PC/板端对照与串口诊断。以下是可直接复现的命令索引。
+
+#### 1. 生成中文数据集
+
+在仓库根目录执行。该命令只生成 `dataset_zh.txt`，不会覆盖当前训练集：
+
+```powershell
+python build_dataset_zh.py
+```
+
+预期输出约 5,600 条平衡中文问答；其中通用聊天/能力边界约 47%、嘟嘟可知识库约 26%、
+计算和换算约 28%。训练记录的 `User:` / `Bot:` 是 `main.py` 的解析标记，不是英文对话数据。
+
+#### 2. 备份并启用中文训练集
+
+首次运行时保存当前数据；已有备份不会被覆盖：
+
+```powershell
+if (-not (Test-Path dataset.before-chinese-only.txt)) { Copy-Item dataset.txt dataset.before-chinese-only.txt }
+Copy-Item dataset_zh.txt dataset.txt -Force
+```
+
+数据变化后必须重新训练 BPE tokenizer：
+
+```bash
+python3 -m pipenv run python3 train_tokenizer.py
+```
+
+#### 3. 分段 GPU 训练
+
+下面的示例在 WSL 中使用第二张可见 GPU（RTX 3090）。`--stop-after 2000` 表示**本次新增**
+2,000 个优化步骤，而不是总训练次数：
+
+```bash
+cd /mnt/d/github/espllm
+CUDA_VISIBLE_DEVICES=1 python3 -m pipenv run python3 main.py --target=esp32s3 --train --stop-after 2000
+```
+
+默认每 200 步、达到本次停止点、早停或按下 `Ctrl+C` 时，都会保存：
+
+```text
+model/model_esp32s3.pt.trainstate
+```
+
+该文件包含模型、optimizer、学习率调度器、迭代数、最佳验证损失、早停计数和随机数状态。
+可用 `--save-interval N` 调整保存频率。
+
+#### 4. 本地中文评测
+
+每个训练段结束后，先运行 14 道关键词回归测试：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python3 -m pipenv run python3 evaluate_zh.py --target esp32s3 --allow-failures
+```
+
+评测读取 `data/chinese/qa_eval_zh.jsonl`，逐题打印模型回答和命中的关键词。`--allow-failures`
+让脚本始终返回成功状态，便于先观察结果；移除此参数则只要存在失败题目就返回非零状态。
+
+#### 5. 恢复继续训练
+
+若评测未达标，使用同一份 `dataset.txt` 和同一套 `bpe-vocab.json` / `bpe-merges.txt` 继续：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python3 -m pipenv run python3 main.py --target=esp32s3 --train --resume --stop-after 2000
+```
+
+恢复期间不能替换训练数据或重新训练 tokenizer，否则 `.trainstate` 会拒绝恢复以防止训练状态与
+数据不一致。按 `Ctrl+C` 后重新执行同一条 `--resume` 命令即可。
+
+#### 6. 导出、烧录与模型版本校验
+
+评测满意后，在**刚才完成训练和评测的同一 WSL Pipenv 环境**导出当前模型：
+
+```bash
+cd /mnt/d/github/espllm
+python3 -m pipenv run python3 convert_model_to_c.py esp32s3
+```
+
+导出会同时更新以下生成物：
+
+- `src/model_weights.hpp`：量化权重、词表、byte-to-token 表与 `bpe-merges.txt` 的 merge rank 表；
+- `src/model_fingerprint.hpp`：`model_weights.hpp` 的完整 SHA-256；
+
+必须在每次训练 tokenizer 或切换模型后重新执行导出。仅更新 `.pt.best` / `.quantized` 而未重新导出，
+会造成 Python 与 ESP32 的 BPE token 序列不一致。
+
+导出日志必须包含：
+
+```text
+Wrote src/model_weights.hpp
+Model HPP SHA-256: <64 位十六进制值>
+model_bpe_byte_tokens[256], model_bpe_merges[1791]
+```
+
+之后在 Windows 的 ESP-IDF PowerShell 编译、烧录与打开监视器：
+
+```powershell
+& C:\esp\v5.5.5\esp-idf\export.ps1
+cd D:\github\espllm
+idf.py build
+idf.py -p COM3 flash
+idf.py -p COM3 monitor
+```
+
+若 `flash` 报串口被占用，先退出旧的 `idf.py monitor` 或其他 COM3 串口软件。N16R8 的模型应用分区
+接近满载，构建日志出现约 2% 剩余空间的警告属于当前配置的预期状态，但不能再加入 OTA 分区或明显增大模型。
+
+启动日志的 `HPP SHA-256` 必须和 WSL 中的结果相同：
+
+```bash
+sha256sum src/model_weights.hpp
+```
+
+哈希相同表示烧录固件构建时使用的 `.hpp` 与当前文件一致；它避免仅凭回答文本或 token ID 猜测模型版本。
+
+#### 7. 板端中文测试、进度与诊断
+
+烧录后可输入 ASCII 命令测试真实中文推理，适合不支持中文 IME 的串口终端：
+
+```text
+:zhhelp  显示题目
+:zh1     嘟嘟可是谁的物品？
+:zh2     嘟嘟可这个名字是什么意思？
+:zh3     嘟嘟可一族住在哪里？
+:zh4     机械巨熊是基础角色设定吗？
+:zh5     可莉会把嘟嘟可称作普通挂件吗？
+:zh6     嘟嘟可是由谁做出来送给可莉的？
+:zh7     嘟嘟可一族远行时想寻找什么？
+```
+
+普通 `:zhN` 命令会立即显示 ASCII 思考进度，避免 12 层模型预填充时看起来无响应；回答 token 会
+先缓存、最后一次性输出，保证拆分到多个 BPE token 的 UTF-8 中文字符不会被 USB Serial/JTAG 打断：
+
+```text
+Bot: [thinking...]........
+Bot: 嘟嘟可是可莉的专属玩偶，由她的妈妈艾莉丝制作。
+```
+
+使用 `:dbgzh1` 可对 `:zh1` 进行详细诊断。它会打印 prompt 的 BPE token ID、每个预填充 token
+的 12 层进度、首次采样的 top-5 logits、生成 token ID 与最终 UTF-8 解码结果。诊断中应满足：
+
+```text
+prefill token 3/9 (id=594)
+prefill token 4/9 (id=758)
+```
+
+这两个 ID 应和 PC 输出一致。PC 端运行相同 prompt 的首 token 对照：
+
+```bash
+python3 -m pipenv run python3 tools/trace_first_token.py \
+  --target esp32s3 \
+  --question '嘟嘟可是谁的物品？'
+```
+
+若板端 token 与 PC 不同，按顺序检查：先确认 HPP SHA-256，再重新运行 `convert_model_to_c.py`，
+最后重新 `build` 和 `flash`。不要仅重烧录旧的 `.hpp`。
+
+#### 8. 回退到原训练数据
+
+中文专用模型会明显弱化英文能力。如需恢复原始语料：
+
+```powershell
+Copy-Item dataset.before-chinese-only.txt dataset.txt -Force
+```
+
+#### GPU / WSL Training and Stop Conditions
+
+Confirm that the active PyTorch build can access CUDA before starting a long run:
+
+```bash
+python3 -m pipenv run python3 -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no GPU')"
+```
+
+On a multi-GPU WSL host, select one GPU explicitly. For example, use the second visible GPU
+(an RTX 3090 with 24 GB VRAM in the reference setup) for single-GPU ESP32-S3 training:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python3 -m pipenv run python3 main.py --target=esp32s3 --train
+```
+
+The ESP32-S3 profile runs for at most 25,000 iterations. It evaluates every 200 iterations and
+early-stops only after 12 consecutive validation evaluations fail to improve the best loss
+(at most 2,400 iterations after the latest improvement). A run whose validation loss keeps
+improving will therefore continue until the 25,000-iteration limit.
+
+Each validation improvement writes `model/model_esp32s3.pt.best`. To stop a satisfactory run
+early, press `Ctrl+C`; the best checkpoint already written remains available. Export it (or the
+automatically created `.quantized` checkpoint after a normal finish) and rebuild the IDF firmware:
+
+```bash
+python3 convert_model_to_c.py esp32s3
+```
+
+```powershell
+& C:\esp\v5.5.5\esp-idf\export.ps1
+idf.py build
+idf.py -p COM3 flash
+```
+
 Realistic expectations: the S3 bot is coherent and personable inside its drilled lane
 (greetings, chit-chat, jokes, facts, simple Q&A, exact arithmetic via the on-device harness),
 single-turn only, greedy-decoded, and unreliable outside its training distribution.

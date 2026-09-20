@@ -1,10 +1,21 @@
+#if defined(ESP_PLATFORM)
+#include "idf_compat.hpp"
+#include "esp_heap_caps.h"
+#include "esp_psram.h"
+#include "esp_random.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#else
 #include <Arduino.h>
+#endif
+#include <ctype.h>
 #include <string.h>
 #if defined(ESP8266) || defined(ESP8266_BOARD)
 #  include <ESP8266WiFi.h>
 #endif
 #include "inference.hpp"
 #include "model_weights.hpp"
+#include "model_fingerprint.hpp"
 
 static constexpr int N_EMBD          = model_n_embd;
 static constexpr int N_HEAD          = model_n_head;
@@ -23,12 +34,14 @@ static constexpr size_t ARENA_SIZE   = 40 * 1024;
 static uint8_t s_arena_mem[ARENA_SIZE] __attribute__((aligned(4)));
 static MemoryArena s_arena(s_arena_mem, ARENA_SIZE);
 static MemoryArena* arena = &s_arena;
-#elif defined(ESP32S3_BOARD)
+#elif defined(ESP32S3_BOARD) || defined(ESP_PLATFORM)
 // High-capacity profile: ESP32-S3 N16R8 (16MB flash + 8MB PSRAM).
 // Arena (4.0MB used) lives in octal PSRAM, supporting up to 512 context tokens.
 static constexpr int INFER_CTX       = (512 < (int)model_block_size) ? 512 : (int)model_block_size;
 static constexpr int MAX_GEN_TOKENS  = 256;
 static constexpr float TEMPERATURE   = 0.0f;
+// Match Python Transformer.generate(rep_penalty=1.0) by default.
+static constexpr float REPETITION_LOGIT_PENALTY = 0.0f;
 static constexpr size_t ARENA_SIZE   = 4096 * 1024;
 static MemoryArena* arena = nullptr;
 #else
@@ -56,7 +69,7 @@ static uint16_t ctx_ids[INFER_CTX];
 static int     ctx_len = 0;
 static int     ctx_pos = 0;
 
-#if defined(ESP32S3_BOARD)
+#if defined(ESP32S3_BOARD) || defined(ESP_PLATFORM)
 struct ExpertPSRAMCache {
     uint8_t*  gate_q;
     uint16_t* gate_s;
@@ -70,12 +83,34 @@ struct ExpertPSRAMCache {
 static ExpertPSRAMCache g_expert_cache = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, -1, -1 };
 #endif
 
+// Enabled only by :dbgzh1. Keep normal inference free of serial debug overhead.
+static bool g_debug_inference = false;
+
+static void print_debug_activation(const char* stage, int layer, const float* values, int n) {
+    double sum = 0.0;
+    double sumsq = 0.0;
+    float maxabs = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const float value = values[i];
+        sum += value;
+        sumsq += (double)value * value;
+        const float abs_value = fabsf(value);
+        if (abs_value > maxabs) maxabs = abs_value;
+    }
+    Serial.printf("[DBG]   layer %d %s sum=%.7g sumsq=%.7g maxabs=%.7g\n",
+                  layer + 1, stage, sum, sumsq, maxabs);
+}
+
 // Inference context must not exceed the RoPE tables baked from training.
 static_assert(INFER_CTX <= (int)model_block_size, "INFER_CTX exceeds trained block_size: regenerate model_weights.hpp");
 
 static void transformer_forward(int token, int pos) {
+    if (g_debug_inference) {
+        Serial.printf("[DBG] prefill token %d/%d (id=%d)\n", pos + 1, ctx_len, token);
+    }
     dequant_emb_row(tok_emb_q + (size_t)token * N_EMBD, tok_emb_scales[token], g_x, N_EMBD);
     for (int l = 0; l < N_LAYER; ++l) {
+        if (g_debug_inference) Serial.printf("[DBG]   layer %d/%d start\n", l + 1, N_LAYER);
         const LayerW& lw = g_layers[l];
         rms_norm(g_x, g_xnorm, lw.ln1_g, N_EMBD);
         matmul_bitnet_ternary(lw.qkv_w, lw.qkv_s, g_xnorm, g_qkv_out, N_EMBD + 2 * N_KV_HEAD * HEAD_DIM, N_EMBD, GRP);
@@ -110,6 +145,9 @@ static void transformer_forward(int token, int pos) {
         }
         matmul_bitnet_ternary(lw.proj_w, lw.proj_s, g_attn_out, g_proj_out, N_EMBD, N_EMBD, GRP);
         for (int d = 0; d < N_EMBD; ++d) g_x[d] += g_proj_out[d];
+        if (g_debug_inference && pos == ctx_len - 1) {
+            print_debug_activation("attn", l, g_x, N_EMBD);
+        }
         rms_norm(g_x, g_xnorm, lw.ln2_g, N_EMBD);
         int best_expert = 0;
         float best_score = -1e9f;
@@ -119,6 +157,9 @@ static void transformer_forward(int token, int pos) {
                 best_score = score;
                 best_expert = e;
             }
+        }
+        if (g_debug_inference && pos == ctx_len - 1) {
+            Serial.printf("[DBG]   layer %d/%d expert=%d\n", l + 1, N_LAYER, best_expert);
         }
         int gate_n_groups = (N_EMBD + GRP - 1) / GRP;
         int gate_bytes_per_row = gate_n_groups * ((GRP + 4) / 5);
@@ -137,7 +178,7 @@ static void transformer_forward(int token, int pos) {
         const uint8_t* p_down_q = lw.experts_down_q + down_q_off;
         const uint16_t* p_down_s = lw.experts_down_s + down_s_off;
 
-#if defined(ESP32S3_BOARD)
+#if defined(ESP32S3_BOARD) || defined(ESP_PLATFORM)
         if (g_expert_cache.gate_q && (g_expert_cache.cached_layer != l || g_expert_cache.cached_expert != best_expert)) {
             size_t gate_q_sz = (size_t)MLP_HIDDEN * gate_bytes_per_row;
             size_t gate_s_sz = (size_t)MLP_HIDDEN * gate_n_groups * sizeof(uint16_t);
@@ -172,11 +213,19 @@ static void transformer_forward(int token, int pos) {
         matmul_bitnet_ternary(p_down_q, p_down_s,
                         g_mlp_hidden, g_mlp_out, N_EMBD, MLP_HIDDEN, GRP);
         for (int d = 0; d < N_EMBD; ++d) g_x[d] += g_mlp_out[d];
+        if (g_debug_inference && pos == ctx_len - 1) {
+            print_debug_activation("mlp", l, g_x, N_EMBD);
+        }
+        if (g_debug_inference) Serial.printf("[DBG]   layer %d/%d done\n", l + 1, N_LAYER);
         yield();
     }
     rms_norm(g_x, g_xnorm, ln_f_gamma, N_EMBD);
-    for (int v = 0; v < (int)model_vocab_size; ++v)
-        g_logits[v] = dot_emb_q(g_xnorm, tok_emb_q + (size_t)v * N_EMBD, tok_emb_scales[v], N_EMBD);
+    // Match Python BitLinearInference for the tied language-model head.
+    // Do not reuse tok_emb_q here: input embeddings and the output head use
+    // different quantization schemes.
+    matmul_bitnet_ternary(lm_head_weights, lm_head_scales,
+                          g_xnorm, g_logits, model_vocab_size, N_EMBD, GRP);
+    if (!g_debug_inference) Serial.print('.');
 }
 
 static bool print_token(int id) {
@@ -185,11 +234,54 @@ static bool print_token(int id) {
     uint32_t start = pgm_read_dword(&model_vocab_offsets[id]);
     uint32_t end   = pgm_read_dword(&model_vocab_offsets[id + 1]);
     for (uint32_t i = start; i < end; ++i) {
-        char c = (char)pgm_read_byte(&model_vocab_bytes[i]);
-        Serial.print(c);
-        if (c == '\n') has_newline = true;
+        const uint8_t byte = pgm_read_byte(&model_vocab_bytes[i]);
+        if (byte == '\n') {
+            Serial.print('\n');
+            has_newline = true;
+        } else if (byte >= 0x20 && byte != 0x7f) {
+            // Do not send model-generated control bytes (notably 0x1d) to
+            // idf.py monitor: it treats them as local keyboard shortcuts.
+            // UTF-8 bytes are >= 0x80, so Chinese output is preserved.
+            Serial.print((char)byte);
+        }
     }
     return has_newline;
+}
+
+static bool token_has_newline(int id) {
+    if (id < 0 || id >= (int)model_vocab_size) return false;
+    uint32_t start = pgm_read_dword(&model_vocab_offsets[id]);
+    uint32_t end   = pgm_read_dword(&model_vocab_offsets[id + 1]);
+    for (uint32_t i = start; i < end; ++i) {
+        if (pgm_read_byte(&model_vocab_bytes[i]) == '\n') return true;
+    }
+    return false;
+}
+
+static int g_debug_sampling_index = 0;
+
+static void print_debug_top_logits() {
+    int top_ids[5] = { -1, -1, -1, -1, -1 };
+    float top_logits[5] = { -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY };
+    for (int id = 0; id < (int)model_vocab_size; ++id) {
+        const float logit = g_logits[id];
+        for (int rank = 0; rank < 5; ++rank) {
+            if (logit > top_logits[rank]) {
+                for (int move = 4; move > rank; --move) {
+                    top_logits[move] = top_logits[move - 1];
+                    top_ids[move] = top_ids[move - 1];
+                }
+                top_logits[rank] = logit;
+                top_ids[rank] = id;
+                break;
+            }
+        }
+    }
+    Serial.print("[DBG] top5 logits:");
+    for (int rank = 0; rank < 5; ++rank) {
+        Serial.printf(" #%d=id%d:%.5f", rank + 1, top_ids[rank], top_logits[rank]);
+    }
+    Serial.println();
 }
 
 static int few_shot_len = 0;
@@ -208,34 +300,46 @@ static void ctx_push(uint16_t id) {
 }
 
 static void ctx_push_str(const char* text) {
-    const char* p = text;
-    while (*p) {
-        int best_id = -1;
-        int best_len = 0;
-        for (int i = 0; i < (int)model_vocab_size; ++i) {
-            uint32_t start = pgm_read_dword(&model_vocab_offsets[i]);
-            uint32_t end   = pgm_read_dword(&model_vocab_offsets[i+1]);
-            int len = end - start;
-            if (len > best_len) {
-                bool match = true;
-                for (int j = 0; j < len; ++j) {
-                    if (p[j] != (char)pgm_read_byte(&model_vocab_bytes[start + j])) {
-                        match = false;
-                        break;
+    // ByteLevel BPE starts with one token per input byte and repeatedly merges
+    // the adjacent pair with the smallest learned merge rank.  Do not replace
+    // this with longest-string matching: it produces different Chinese IDs.
+    uint16_t pieces[INFER_CTX * 2 + 16];
+    int piece_count = 0;
+    for (const uint8_t* p = (const uint8_t*)text; *p && piece_count < (int)(sizeof(pieces) / sizeof(pieces[0])); ++p) {
+        pieces[piece_count++] = model_bpe_byte_tokens[*p];
+    }
+
+    while (piece_count > 1) {
+        int best_index = -1;
+        uint16_t best_rank = UINT16_MAX;
+        uint16_t best_merged = 0;
+        for (int i = 0; i + 1 < piece_count; ++i) {
+            const uint32_t key = ((uint32_t)pieces[i] << 16) | pieces[i + 1];
+            int low = 0;
+            int high = (int)(sizeof(model_bpe_merges) / sizeof(model_bpe_merges[0])) - 1;
+            while (low <= high) {
+                const int mid = low + (high - low) / 2;
+                const BpeMerge merge = model_bpe_merges[mid];
+                if (merge.key < key) low = mid + 1;
+                else if (merge.key > key) high = mid - 1;
+                else {
+                    if (merge.rank < best_rank) {
+                        best_rank = merge.rank;
+                        best_index = i;
+                        best_merged = merge.merged;
                     }
-                }
-                if (match) {
-                    best_len = len;
-                    best_id = i;
+                    break;
                 }
             }
         }
-        if (best_id != -1) {
-            ctx_push((uint16_t)best_id);
-            p += best_len;
-        } else {
-            p++;
-        }
+        if (best_index < 0) break;
+        pieces[best_index] = best_merged;
+        memmove(&pieces[best_index + 1], &pieces[best_index + 2],
+                (piece_count - best_index - 2) * sizeof(pieces[0]));
+        --piece_count;
+    }
+    for (int i = 0; i < piece_count; ++i) {
+        ctx_push(pieces[i]);
     }
 }
 
@@ -246,13 +350,16 @@ static int sample_next(float temp) {
         ctx_pos++;
         llm_optimistic_yield(1);
     }
-    int rep_window = (ctx_len < 20) ? ctx_len : 20;
-    for (int c = ctx_len - rep_window; c < ctx_len; ++c) {
-        uint16_t id = ctx_ids[c];
-        if (id < model_vocab_size) {
-            g_logits[id] -= 1.6f;
+    if (REPETITION_LOGIT_PENALTY > 0.0f) {
+        int rep_window = (ctx_len < 20) ? ctx_len : 20;
+        for (int c = ctx_len - rep_window; c < ctx_len; ++c) {
+            uint16_t id = ctx_ids[c];
+            if (id < model_vocab_size) {
+                g_logits[id] -= REPETITION_LOGIT_PENALTY;
+            }
         }
     }
+    if (g_debug_inference) print_debug_top_logits();
     if (temp <= 0.0f) return argmax(g_logits, (int)model_vocab_size);
     for (int i = 0; i < (int)model_vocab_size; ++i) g_logits[i] /= temp;
     softmax(g_logits, (int)model_vocab_size);
@@ -428,12 +535,50 @@ static void clear_context() {
     ctx_pos = 0;
 }
 
+// ASCII-only serial commands for validating UTF-8 Chinese prompts on terminals
+// where an IME cannot send Chinese reliably. The answer is still generated by
+// the model; it is intentionally not a hard-coded Q&A demo.
+static const char* chinese_test_prompt(const char* command) {
+    if (strcmp(command, ":zh1") == 0) return "嘟嘟可是谁的物品？";
+    if (strcmp(command, ":dbgzh1") == 0) return "嘟嘟可是谁的物品？";
+    if (strcmp(command, ":zh2") == 0) return "嘟嘟可这个名字是什么意思？";
+    if (strcmp(command, ":zh3") == 0) return "嘟嘟可一族住在哪里？";
+    if (strcmp(command, ":zh4") == 0) return "机械巨熊是基础角色设定吗？";
+    if (strcmp(command, ":zh5") == 0) return "可莉会把嘟嘟可称作普通挂件吗？";
+    if (strcmp(command, ":dbgzh5") == 0) return "可莉会把嘟嘟可称作普通挂件吗？";
+    if (strcmp(command, ":zh6") == 0) return "嘟嘟可是由谁做出来送给可莉的？";
+    if (strcmp(command, ":dbgzh6") == 0) return "嘟嘟可是由谁做出来送给可莉的？";
+    if (strcmp(command, ":zh7") == 0) return "嘟嘟可一族远行时想寻找什么？";
+    if (strcmp(command, ":dbgzh7") == 0) return "嘟嘟可一族远行时想寻找什么？";
+    return nullptr;
+}
+
+static bool print_chinese_test_help(const char* command) {
+    if (strcmp(command, ":zhhelp") != 0) return false;
+    Serial.println("\nChinese model tests (real inference):");
+    Serial.println("  :zh1  嘟嘟可是谁的物品？");
+    Serial.println("  :dbgzh1  :zh1 with per-token/layer diagnostic logs");
+    Serial.println("  :zh2  嘟嘟可这个名字是什么意思？");
+    Serial.println("  :zh3  嘟嘟可一族住在哪里？");
+    Serial.println("  :zh4  机械巨熊是基础角色设定吗？");
+    Serial.println("  :zh5  可莉会把嘟嘟可称作普通挂件吗？");
+    Serial.println("  :dbgzh5  :zh5 with per-token/layer diagnostic logs");
+    Serial.println("  :zh6  嘟嘟可是由谁做出来送给可莉的？");
+    Serial.println("  :dbgzh6  :zh6 with per-token/layer diagnostic logs");
+    Serial.println("  :zh7  嘟嘟可一族远行时想寻找什么？");
+    Serial.println("  :dbgzh7  :zh7 with per-token/layer diagnostic logs");
+    return true;
+}
+
 static void run_chat() {
     Serial.print("\nUser: ");
     char input[INFER_CTX + 1];
     int  ilen = 0;
     while (true) {
-        if (!Serial.available()) continue;
+        if (!Serial.available()) {
+            delay(1);
+            continue;
+        }
         char c = (char)Serial.read();
         if (c == '\n' || c == '\r') { if (ilen > 0) break; continue; }
         if (c == '\b' || c == 0x7F) {
@@ -448,6 +593,16 @@ static void run_chat() {
     input[ilen] = '\0';
     Serial.println();
     if (ilen == 0) return;
+
+    g_debug_inference = false;
+
+    if (print_chinese_test_help(input)) return;
+    if (const char* preset = chinese_test_prompt(input)) {
+        g_debug_inference = strncmp(input, ":dbgzh", 6) == 0;
+        Serial.print("[Chinese test] ");
+        Serial.println(preset);
+        snprintf(input, sizeof(input), "%s", preset);
+    }
 
     clear_context();
 
@@ -483,16 +638,29 @@ static void run_chat() {
         snprintf(clean_input, sizeof(clean_input), "%s", input);
     }
 
-    char prompt[INFER_CTX * 2];
+    char prompt[INFER_CTX * 2 + 16];
     snprintf(prompt, sizeof(prompt), "User: %s\nBot:", clean_input);
     ctx_push_str(prompt);
+    if (g_debug_inference) {
+        Serial.printf("[DBG] prompt bytes=%u, encoded tokens=%d\n", (unsigned)strlen(prompt), ctx_len);
+    }
     Serial.print("Bot:");
+    if (!g_debug_inference) Serial.print(" [thinking...]");
     unsigned long t_start = millis();
+    uint16_t output_ids[MAX_GEN_TOKENS];
+    int output_len = 0;
     for (int i = 0; i < MAX_GEN_TOKENS; ++i) {
         llm_optimistic_yield(1);
+        g_debug_sampling_index = i + 1;
+        if (g_debug_inference) Serial.printf("\n[DBG] sampling output token %d\n", i + 1);
         int next_id  = sample_next(TEMPERATURE);
+        if (g_debug_inference) Serial.printf("[DBG] sampled id=%d\n", next_id);
         if (next_id == 0) break; 
-        bool hit_newline = print_token(next_id);
+        bool hit_newline = token_has_newline(next_id);
+        // Keep UTF-8 byte fragments together. Some Chinese characters span
+        // BPE tokens, and USB Serial/JTAG is unreliable when they are emitted
+        // one token at a time while inference continues.
+        output_ids[output_len++] = (uint16_t)next_id;
         ctx_push((uint16_t)next_id);
         if (hit_newline && i > 1) break;
         llm_optimistic_yield(1);
@@ -501,6 +669,15 @@ static void run_chat() {
         ctx_push_str("\n");
     }
     unsigned long elapsed = millis() - t_start;
+    if (g_debug_inference) {
+        Serial.print("[DBG] generated token ids:");
+        for (int i = 0; i < output_len; ++i) Serial.printf(" %u", output_ids[i]);
+        Serial.print("\nBot (decoded):");
+        for (int i = 0; i < output_len; ++i) print_token(output_ids[i]);
+    } else {
+        Serial.print("\nBot:");
+        for (int i = 0; i < output_len; ++i) print_token(output_ids[i]);
+    }
     Serial.println();
     Serial.printf("[%lu ms total]\n", elapsed);
 }
@@ -513,6 +690,7 @@ static void print_model_info() {
     Serial.printf("  ctx    : %d tokens\n",   INFER_CTX);
     Serial.printf("  mlp_h  : %d\n",          MLP_HIDDEN);
     Serial.printf("  flash  : %u bytes\n",    (unsigned)model_weights_len);
+    Serial.printf("  HPP SHA-256: %s\n",      model_weights_hpp_sha256);
 }
 
 static bool alloc_buffers() {
@@ -531,7 +709,7 @@ static bool alloc_buffers() {
     g_mlp_out    = (float*)arena->alloc(N_EMBD                 * sizeof(float));
     g_logits     = (float*)arena->alloc(model_vocab_size       * sizeof(float));
 
-#if defined(ESP32S3_BOARD)
+#if defined(ESP32S3_BOARD) || defined(ESP_PLATFORM)
     int gate_n_groups = (N_EMBD + GRP - 1) / GRP;
     int gate_bytes_per_row = gate_n_groups * ((GRP + 4) / 5);
     size_t gate_q_sz = (size_t)MLP_HIDDEN * gate_bytes_per_row;
@@ -573,9 +751,15 @@ void setup() {
     delay(1);
     ESP.wdtEnable(5000);
     ESP.wdtFeed();
-#elif defined(ESP32S3_BOARD)
+#elif defined(ESP32S3_BOARD) || defined(ESP_PLATFORM)
     if (!arena) {
-        uint8_t* p = (uint8_t*)ps_malloc(ARENA_SIZE); // 8MB octal PSRAM on N16R8
+        uint8_t* p = (uint8_t*)
+#if defined(ESP_PLATFORM)
+            heap_caps_malloc(ARENA_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+            ps_malloc(ARENA_SIZE);
+#endif
+        // 8MB octal PSRAM on N16R8
         if (!p) p = (uint8_t*)malloc(ARENA_SIZE);      // last-resort SRAM attempt
         if (p) arena = new MemoryArena(p, ARENA_SIZE);
     }
@@ -589,13 +773,13 @@ void setup() {
     Serial.println("║      ESP-LLM  v1.0       ║");
 #if defined(ESP8266) || defined(ESP8266_BOARD)
     Serial.println("║ BitNet 1.58b on ESP8266  ║");
-#elif defined(ESP32S3_BOARD)
+#elif defined(ESP32S3_BOARD) || defined(ESP_PLATFORM)
     Serial.println("║ BitNet 1.58b on ESP32-S3 ║");
 #else
     Serial.println("║ BitNet 1.58b on ESP32    ║");
 #endif
     Serial.println("╚══════════════════════════╝");
-#if defined(ESP32S3_BOARD)
+#if defined(ESP32S3_BOARD) || defined(ESP_PLATFORM)
     Serial.printf("PSRAM: %u B | Free heap at boot: %u B\n",
                   (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreeHeap());
 #else
@@ -624,3 +808,10 @@ void loop() {
     }
     run_chat();
 }
+
+#if defined(ESP_PLATFORM)
+extern "C" void app_main(void) {
+    setup();
+    while (true) loop();
+}
+#endif
